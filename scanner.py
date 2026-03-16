@@ -7,14 +7,11 @@ import re
 import sys
 from urllib.parse import urljoin, urlparse
 
-import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 TARGET_URL = os.environ.get("TARGET_URL", "").strip()
 SCAN_ID = os.environ.get("SCAN_ID", "").strip()
-CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 
 PROGRESS_STAGES = [
     "identity_built",
@@ -24,8 +21,6 @@ PROGRESS_STAGES = [
     "js_extracted",
     "endpoints_discovered",
     "network_analyzed",
-    "ai_verdict_requested",
-    "ai_verdict_received",
     "complete",
 ]
 
@@ -333,103 +328,8 @@ def collect_attribute_urls(soup, base_url):
     return dedupe_dict_list(out, ["url", "discovery_method", "raw_original"])
 
 
-async def post_progress(stage):
-    if not CALLBACK_URL:
-        return
-    url = get_progress_url(CALLBACK_URL)
-    async with httpx.AsyncClient(timeout=20) as client:
-        try:
-            print(f"progress:{stage}", flush=True)
-            await client.post(url, json={"stage": stage})
-        except Exception:
-            return
-
-
-def default_verdict():
-    return {
-        "threat_score": 50,
-        "classification": "suspicious",
-        "confidence": 40,
-        "summary": "Analysis completed with fallback verdict due AI response limitations.",
-        "key_findings": ["Fallback verdict used"],
-        "recommended_action": "manual_review",
-        "detailed_reasoning": "The model response was unavailable or not parseable.",
-        "attack_surface_mapping": {
-            "entry_points": [],
-            "sensitive_routes": [],
-            "third_party_risk_nodes": [],
-            "notes": "No additional attack-surface mapping available in fallback mode",
-        },
-    }
-
-
-def normalize_verdict(data):
-    fixed_classes = {
-        "clean",
-        "suspicious",
-        "malicious",
-        "phishing",
-        "malware_distribution",
-        "cryptojacking",
-        "data_harvesting",
-    }
-    fixed_actions = {
-        "allow",
-        "monitor",
-        "manual_review",
-        "block",
-        "quarantine",
-    }
-    verdict = default_verdict()
-    if isinstance(data, dict):
-        if isinstance(data.get("threat_score"), (int, float)):
-            verdict["threat_score"] = max(0, min(100, int(data["threat_score"])))
-        if isinstance(data.get("classification"), str) and data["classification"] in fixed_classes:
-            verdict["classification"] = data["classification"]
-        if isinstance(data.get("confidence"), (int, float)):
-            verdict["confidence"] = max(0, min(100, int(data["confidence"])))
-        if isinstance(data.get("summary"), str) and data["summary"].strip():
-            verdict["summary"] = data["summary"].strip()
-        if isinstance(data.get("key_findings"), list):
-            verdict["key_findings"] = [str(x) for x in data["key_findings"]][:20]
-        if isinstance(data.get("recommended_action"), str) and data["recommended_action"] in fixed_actions:
-            verdict["recommended_action"] = data["recommended_action"]
-        if isinstance(data.get("detailed_reasoning"), str) and data["detailed_reasoning"].strip():
-            verdict["detailed_reasoning"] = data["detailed_reasoning"]
-        if isinstance(data.get("attack_surface_mapping"), dict):
-            verdict["attack_surface_mapping"] = data["attack_surface_mapping"]
-    return verdict
-
-
-async def call_mistral(scan_context):
-    if not MISTRAL_API_KEY:
-        return default_verdict()
-    prompt = (
-        "You are a security analyst. Return strict JSON only with keys: "
-        "threat_score, classification, confidence, summary, key_findings, recommended_action, detailed_reasoning, attack_surface_mapping. "
-        "classification must be one of clean,suspicious,malicious,phishing,malware_distribution,cryptojacking,data_harvesting. "
-        "recommended_action must be one of allow,monitor,manual_review,block,quarantine. "
-        "attack_surface_mapping must include entry_points,sensitive_routes,third_party_risk_nodes,notes. "
-        "Analyze this scan context: "
-        + json.dumps(scan_context, ensure_ascii=False)
-    )
-    payload = {
-        "model": "mistral-medium-latest",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 1200,
-        "top_p": 1,
-    }
-    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        try:
-            resp = await client.post("https://api.mistral.ai/v1/chat/completions", json=payload, headers=headers)
-            body = resp.json()
-            content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
-            parsed = extract_json_object(content)
-            return normalize_verdict(parsed)
-        except Exception:
-            return default_verdict()
+def log_stage(stage):
+    print(f"progress:{stage}", flush=True)
 
 
 def build_redirect_chain(main_request):
@@ -654,11 +554,11 @@ def analyze_javascript(html_content, final_url, hooked_calls, network_responses)
 
 
 async def run_scan():
-    if not TARGET_URL or not SCAN_ID or not CALLBACK_URL:
-        raise RuntimeError("Missing required environment values TARGET_URL, SCAN_ID, or CALLBACK_URL")
+    if not TARGET_URL or not SCAN_ID:
+        raise RuntimeError("Missing required environment values TARGET_URL or SCAN_ID")
 
     identity = build_identity()
-    await post_progress(PROGRESS_STAGES[0])
+    log_stage(PROGRESS_STAGES[0])
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -670,7 +570,7 @@ async def run_scan():
             extra_http_headers=identity["headers"],
         )
         await context.add_init_script(INIT_SCRIPT)
-        await post_progress(PROGRESS_STAGES[1])
+        log_stage(PROGRESS_STAGES[1])
 
         page = await context.new_page()
         requests_log, responses_log = set_network_hooks(page)
@@ -680,11 +580,11 @@ async def run_scan():
         except Exception:
             main_response = await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=45000)
         await asyncio.sleep(3)
-        await post_progress(PROGRESS_STAGES[2])
+        log_stage(PROGRESS_STAGES[2])
 
         screenshot_bytes = await page.screenshot(full_page=True)
         screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
-        await post_progress(PROGRESS_STAGES[3])
+        log_stage(PROGRESS_STAGES[3])
 
         html_content = await page.content()
         final_url = page.url
@@ -693,12 +593,12 @@ async def run_scan():
 
         hooked_calls = await page.evaluate("window.__intelliscan_calls || []")
         js_analysis = analyze_javascript(html_content, final_url, hooked_calls, responses_log)
-        await post_progress(PROGRESS_STAGES[4])
+        log_stage(PROGRESS_STAGES[4])
 
         soup = BeautifulSoup(html_content, "html.parser")
         collected_urls = collect_attribute_urls(soup, final_url)
         categorized = categorize_urls(final_url, responses_log, collected_urls, js_analysis["js_discovered_urls"])
-        await post_progress(PROGRESS_STAGES[5])
+        log_stage(PROGRESS_STAGES[5])
 
         network_activity = dedupe_dict_list(
             [
@@ -715,45 +615,11 @@ async def run_scan():
             ],
             ["url", "method", "resource_type", "status"],
         )
-        await post_progress(PROGRESS_STAGES[6])
+        log_stage(PROGRESS_STAGES[6])
 
         redirect_chain = []
         if main_response is not None:
             redirect_chain = build_redirect_chain(main_response.request)
-
-        scan_context = {
-            "target_url": TARGET_URL,
-            "final_url": final_url,
-            "page_title": page_title,
-            "redirect_chain": redirect_chain,
-            "counts": {
-                "network": len(network_activity),
-                "crawled": len(categorized["crawled_urls"]),
-                "collected": len(categorized["collected_urls"]),
-                "hidden": len(categorized["hidden_endpoints"]),
-                "hidden_inputs": len(js_analysis["hidden_inputs"]),
-                "suspicious_variables": len(js_analysis["suspicious_variables"]),
-                "secrets": len(js_analysis["secrets"]),
-            },
-            "javascript": {
-                "obfuscation_score": js_analysis["obfuscation_score"],
-                "obfuscation_markers": js_analysis["obfuscation_markers"],
-                "hidden_inputs": js_analysis["hidden_inputs"],
-                "suspicious_variables": js_analysis["suspicious_variables"],
-                "secrets": js_analysis["secrets"],
-            },
-            "url_intelligence": {
-                "crawled_urls": categorized["crawled_urls"][:120],
-                "collected_urls": categorized["collected_urls"][:120],
-                "hidden_endpoints": categorized["hidden_endpoints"][:120],
-                "internal_paths": categorized["internal_paths"],
-                "third_party_domains": categorized["third_party_domains"],
-            },
-        }
-
-        await post_progress(PROGRESS_STAGES[7])
-        verdict = await call_mistral(scan_context)
-        await post_progress(PROGRESS_STAGES[8])
 
         result = {
             "scan_id": SCAN_ID,
@@ -779,14 +645,6 @@ async def run_scan():
                 "secrets": js_analysis["secrets"],
                 "js_discovered_urls": js_analysis["js_discovered_urls"],
             },
-            "threat_score": verdict["threat_score"],
-            "classification": verdict["classification"],
-            "confidence": verdict["confidence"],
-            "summary": verdict["summary"],
-            "key_findings": verdict["key_findings"],
-            "recommended_action": verdict["recommended_action"],
-            "ai_reasoning": verdict["detailed_reasoning"],
-            "attack_surface_mapping": verdict["attack_surface_mapping"],
             "screenshot_base64": screenshot_b64,
         }
 
@@ -794,26 +652,17 @@ async def run_scan():
         return result
 
 
-async def post_result(payload):
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(CALLBACK_URL, json=payload)
-        response.raise_for_status()
-
-
 async def main():
     try:
         print("scanner:start", flush=True)
         result = await run_scan()
-        await post_result(result)
-        await post_progress(PROGRESS_STAGES[9])
+        output_path = f"scan-result-{SCAN_ID}.json"
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False)
+        print(f"scanner:artifact:{output_path}", flush=True)
         print("scanner:complete", flush=True)
     except Exception as exc:
         print(f"scanner:error:{exc}", flush=True)
-        error_payload = {"scan_id": SCAN_ID, "status": "failed", "error": str(exc)}
-        try:
-            await post_result(error_payload)
-        except Exception as post_exc:
-            print(f"scanner:callback_error:{post_exc}", flush=True)
         raise
 
 

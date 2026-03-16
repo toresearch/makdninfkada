@@ -1,4 +1,5 @@
 name: Scanner Workflow
+run-name: Scan-${{ inputs.scan_id }}
 
 on:
   workflow_dispatch:
@@ -8,9 +9,6 @@ on:
         required: true
       scan_id:
         description: 'Scan ID'
-        required: true
-      callback_url:
-        description: 'Callback URL for results'
         required: true
 
 jobs:
@@ -31,6 +29,11 @@ jobs:
         env:
           TARGET_URL: ${{ github.event.inputs.target_url }}
           SCAN_ID: ${{ github.event.inputs.scan_id }}
-          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
-          MISTRAL_API_KEY: c0e8GZSgG3cPq920PGZ1HtBkfuqKlRlB
         run: python scanner.py
+
+      - name: Upload Scan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-result-${{ github.event.inputs.scan_id }}
+          path: scan-result-${{ github.event.inputs.scan_id }}.json
+          if-no-files-found: error
