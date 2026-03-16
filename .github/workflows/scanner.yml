@@ -1,0 +1,36 @@
+name: Scanner Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL to scan'
+        required: true
+      scan_id:
+        description: 'Scan ID'
+        required: true
+      callback_url:
+        description: 'Callback URL for results'
+        required: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.40.0-jammy
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Scanner
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+          SCAN_ID: ${{ github.event.inputs.scan_id }}
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          MISTRAL_API_KEY: c0e8GZSgG3cPq920PGZ1HtBkfuqKlRlB
+        run: python scanner.py

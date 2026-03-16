@@ -1,0 +1,7 @@
+Flask==2.3.3
+Flask-CORS==4.0.0
+requests==2.31.0
+httpx
+beautifulsoup4==4.12.2
+playwright==1.40.0
+mistralai==0.0.11

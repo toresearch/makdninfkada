@@ -1,0 +1,824 @@
+import asyncio
+import base64
+import json
+import os
+import random
+import re
+import sys
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+
+TARGET_URL = os.environ.get("TARGET_URL", "").strip()
+SCAN_ID = os.environ.get("SCAN_ID", "").strip()
+CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
+
+PROGRESS_STAGES = [
+    "identity_built",
+    "browser_launched",
+    "page_loaded",
+    "screenshot_captured",
+    "js_extracted",
+    "endpoints_discovered",
+    "network_analyzed",
+    "ai_verdict_requested",
+    "ai_verdict_received",
+    "complete",
+]
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) OPR/108.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Vivaldi/6.6.3271.61 Chrome/122.0.0.0 Safari/537.36",
+]
+
+VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1366, "height": 768},
+    {"width": 1536, "height": 864},
+    {"width": 1440, "height": 900},
+    {"width": 1280, "height": 720},
+    {"width": 1600, "height": 900},
+]
+
+LOCALES = ["en-US", "en-GB", "de-DE", "fr-FR", "es-ES", "it-IT", "ja-JP", "pt-BR"]
+TIMEZONES = [
+    "America/New_York",
+    "America/Los_Angeles",
+    "Europe/London",
+    "Europe/Paris",
+    "Asia/Tokyo",
+    "Asia/Singapore",
+    "Australia/Sydney",
+    "America/Toronto",
+]
+
+
+def normalize_url(raw_value, base_url):
+    if not raw_value:
+        return ""
+    value = str(raw_value).strip()
+    if not value:
+        return ""
+    if value.startswith("javascript:") or value.startswith("data:") or value.startswith("mailto:") or value.startswith("tel:"):
+        return ""
+    return urljoin(base_url, value)
+
+
+def dedupe_dict_list(items, key_fields):
+    seen = set()
+    out = []
+    for item in items:
+        key = tuple(item.get(k, "") for k in key_fields)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def domain_split(urls, base_host):
+    internal = []
+    third_party = []
+    for u in urls:
+        parsed = urlparse(u.get("url", ""))
+        if not parsed.netloc:
+            continue
+        if parsed.netloc == base_host:
+            internal.append(u)
+        else:
+            third_party.append(u)
+    return internal, third_party
+
+
+def extract_json_object(text):
+    if not text:
+        return None
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+
+def get_progress_url(callback_url):
+    if "/api/callback/" in callback_url:
+        return callback_url.replace("/api/callback/", "/api/progress/")
+    if "/callback/" in callback_url:
+        return callback_url.replace("/callback/", "/progress/")
+    return callback_url
+
+
+def classify_confidence(pattern_name):
+    if pattern_name in {"fetch", "xhr_open", "axios", "jquery"}:
+        return "high"
+    if pattern_name in {"path_literal", "template_literal"}:
+        return "medium"
+    return "low"
+
+
+def build_browser_headers(user_agent, locale):
+    platform = "Windows"
+    if "Macintosh" in user_agent:
+        platform = "macOS"
+    if "Linux" in user_agent and "Android" not in user_agent:
+        platform = "Linux"
+    if "Android" in user_agent:
+        platform = "Android"
+    if "iPhone" in user_agent:
+        platform = "iOS"
+    mobile = "?1" if "Mobile" in user_agent or "Android" in user_agent or "iPhone" in user_agent else "?0"
+    if "Firefox" in user_agent:
+        sec_ch = '"Not.A/Brand";v="99", "Firefox";v="123"'
+    elif "Edg/" in user_agent:
+        sec_ch = '"Not.A/Brand";v="99", "Microsoft Edge";v="122", "Chromium";v="122"'
+    elif "OPR/" in user_agent:
+        sec_ch = '"Not.A/Brand";v="99", "Opera";v="108", "Chromium";v="122"'
+    elif "Safari" in user_agent and "Chrome" not in user_agent:
+        sec_ch = '"Not.A/Brand";v="99", "Safari";v="17"'
+    else:
+        sec_ch = '"Not.A/Brand";v="99", "Google Chrome";v="122", "Chromium";v="122"'
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": f"{locale},en;q=0.9",
+        "Cache-Control": "max-age=0",
+        "DNT": "1",
+        "Sec-CH-UA": sec_ch,
+        "Sec-CH-UA-Mobile": mobile,
+        "Sec-CH-UA-Platform": f'"{platform}"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": user_agent,
+    }
+
+
+def build_identity():
+    user_agent = random.choice(USER_AGENTS)
+    viewport = random.choice(VIEWPORTS)
+    locale = random.choice(LOCALES)
+    timezone_id = random.choice(TIMEZONES)
+    headers = build_browser_headers(user_agent, locale)
+    return {
+        "user_agent": user_agent,
+        "viewport": viewport,
+        "locale": locale,
+        "timezone_id": timezone_id,
+        "headers": headers,
+    }
+
+
+def analyze_obfuscation(script_text):
+    markers = {
+        "eval_usage": len(re.findall(r"\beval\s*\(", script_text)),
+        "base64_blobs": len(re.findall(r"[A-Za-z0-9+/]{120,}={0,2}", script_text)),
+        "hex_encoding": len(re.findall(r"\\x[0-9a-fA-F]{2}", script_text)),
+        "from_char_code": len(re.findall(r"String\.fromCharCode\s*\(", script_text)),
+        "atob_calls": len(re.findall(r"\batob\s*\(", script_text)),
+        "document_write": len(re.findall(r"document\.write\s*\(", script_text)),
+    }
+    score = min(
+        100,
+        markers["eval_usage"] * 12
+        + markers["base64_blobs"] * 8
+        + markers["hex_encoding"] * 1
+        + markers["from_char_code"] * 10
+        + markers["atob_calls"] * 8
+        + markers["document_write"] * 6,
+    )
+    return score, markers
+
+
+def detect_secrets(script_text):
+    findings = []
+    patterns = {
+        "api_key": r"(?:api[_-]?key|api_secret|access_token|secret_key)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]",
+        "jwt": r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        "aws_access_key": r"AKIA[0-9A-Z]{16}",
+        "password_assignment": r"(?:password|passwd|pwd)\s*[:=]\s*['\"][^'\"]{1,}['\"]",
+    }
+    for name, pat in patterns.items():
+        matches = re.findall(pat, script_text, flags=re.IGNORECASE)
+        if matches:
+            findings.append({"type": name, "count": len(matches)})
+    return findings
+
+
+def parse_hidden_inputs(soup):
+    out = []
+    sensitive_words = ["token", "csrf", "secret", "auth", "key", "password", "session"]
+    for node in soup.select('input[type="hidden"]'):
+        name = (node.get("name") or "").strip()
+        value = (node.get("value") or "").strip()
+        flag = any(w in name.lower() for w in sensitive_words)
+        out.append({"name": name, "value": value, "sensitive_name": flag})
+    return out
+
+
+def parse_suspicious_variables(script_text):
+    out = []
+    pattern = re.compile(r"\b(?:var|let|const)\s+([a-zA-Z_$][\w$]*)\s*=\s*([^;\n]+)", re.IGNORECASE)
+    key_words = ["key", "token", "secret", "api", "endpoint", "url", "auth", "password"]
+    for match in pattern.finditer(script_text):
+        name = match.group(1).strip()
+        raw_value = match.group(2).strip()
+        low_name = name.lower()
+        if not any(k in low_name for k in key_words):
+            continue
+        raw_low = raw_value.lower()
+        suspicious = raw_low in {"null", "undefined", "''", '""'} or "todo" in raw_low or "changeme" in raw_low
+        if suspicious:
+            out.append({"name": name, "value": raw_value})
+    return out
+
+
+def extract_js_endpoints_from_text(script_text, base_url):
+    patterns = [
+        ("fetch", re.compile(r"fetch\s*\(\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)),
+        (
+            "xhr_open",
+            re.compile(r"\.open\s*\(\s*['\"](?:GET|POST|PUT|PATCH|DELETE|OPTIONS)['\"]\s*,\s*['\"]([^'\"]+)['\"]", re.IGNORECASE),
+        ),
+        (
+            "axios",
+            re.compile(r"axios\s*\.\s*(?:get|post|put|patch|delete|request)\s*\(\s*['\"]([^'\"]+)['\"]", re.IGNORECASE),
+        ),
+        (
+            "jquery",
+            re.compile(r"\$\s*\.\s*(?:ajax|get|post)\s*\(\s*['\"]([^'\"]+)['\"]", re.IGNORECASE),
+        ),
+        ("path_literal", re.compile(r"['\"]((?:/|\.\.?/)[^'\"\s]{2,})['\"]", re.IGNORECASE)),
+        ("template_literal", re.compile(r"`((?:/|\.\.?/)[^`\s]{2,})`", re.IGNORECASE)),
+        (
+            "var_assignment",
+            re.compile(r"\b(?:var|let|const)\s+[a-zA-Z_$][\w$]*\s*=\s*['\"]((?:/|https?://)[^'\"]+)['\"]", re.IGNORECASE),
+        ),
+    ]
+    found = []
+    for pname, preg in patterns:
+        for m in preg.finditer(script_text):
+            raw = m.group(1).strip()
+            absolute = normalize_url(raw, base_url)
+            if not absolute:
+                continue
+            found.append(
+                {
+                    "url": absolute,
+                    "raw_original": raw,
+                    "pattern": pname,
+                    "confidence": classify_confidence(pname),
+                }
+            )
+    return found
+
+
+def collect_attribute_urls(soup, base_url):
+    out = []
+    specs = [
+        ("a", "href"),
+        ("link", "href"),
+        ("script", "src"),
+        ("img", "src"),
+        ("iframe", "src"),
+        ("source", "src"),
+        ("video", "src"),
+        ("audio", "src"),
+        ("form", "action"),
+    ]
+    for tag, attr in specs:
+        for node in soup.find_all(tag):
+            raw = (node.get(attr) or "").strip()
+            if not raw:
+                continue
+            absolute = normalize_url(raw, base_url)
+            if not absolute:
+                continue
+            out.append(
+                {
+                    "url": absolute,
+                    "discovery_method": f"{tag}.{attr}",
+                    "raw_original": raw,
+                }
+            )
+    for node in soup.find_all(style=True):
+        inline_style = node.get("style") or ""
+        for raw in re.findall(r"url\(([^)]+)\)", inline_style, flags=re.IGNORECASE):
+            cleaned = raw.strip().strip('"').strip("'")
+            absolute = normalize_url(cleaned, base_url)
+            if absolute:
+                out.append({"url": absolute, "discovery_method": "inline_style.url", "raw_original": cleaned})
+    for node in soup.find_all("style"):
+        css_text = node.get_text("\n", strip=False)
+        for raw in re.findall(r"url\(([^)]+)\)", css_text, flags=re.IGNORECASE):
+            cleaned = raw.strip().strip('"').strip("'")
+            absolute = normalize_url(cleaned, base_url)
+            if absolute:
+                out.append({"url": absolute, "discovery_method": "style_tag.url", "raw_original": cleaned})
+    return dedupe_dict_list(out, ["url", "discovery_method", "raw_original"])
+
+
+async def post_progress(stage):
+    if not CALLBACK_URL:
+        return
+    url = get_progress_url(CALLBACK_URL)
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            print(f"progress:{stage}", flush=True)
+            await client.post(url, json={"stage": stage})
+        except Exception:
+            return
+
+
+def default_verdict():
+    return {
+        "threat_score": 50,
+        "classification": "suspicious",
+        "confidence": 40,
+        "summary": "Analysis completed with fallback verdict due AI response limitations.",
+        "key_findings": ["Fallback verdict used"],
+        "recommended_action": "manual_review",
+        "detailed_reasoning": "The model response was unavailable or not parseable.",
+        "attack_surface_mapping": {
+            "entry_points": [],
+            "sensitive_routes": [],
+            "third_party_risk_nodes": [],
+            "notes": "No additional attack-surface mapping available in fallback mode",
+        },
+    }
+
+
+def normalize_verdict(data):
+    fixed_classes = {
+        "clean",
+        "suspicious",
+        "malicious",
+        "phishing",
+        "malware_distribution",
+        "cryptojacking",
+        "data_harvesting",
+    }
+    fixed_actions = {
+        "allow",
+        "monitor",
+        "manual_review",
+        "block",
+        "quarantine",
+    }
+    verdict = default_verdict()
+    if isinstance(data, dict):
+        if isinstance(data.get("threat_score"), (int, float)):
+            verdict["threat_score"] = max(0, min(100, int(data["threat_score"])))
+        if isinstance(data.get("classification"), str) and data["classification"] in fixed_classes:
+            verdict["classification"] = data["classification"]
+        if isinstance(data.get("confidence"), (int, float)):
+            verdict["confidence"] = max(0, min(100, int(data["confidence"])))
+        if isinstance(data.get("summary"), str) and data["summary"].strip():
+            verdict["summary"] = data["summary"].strip()
+        if isinstance(data.get("key_findings"), list):
+            verdict["key_findings"] = [str(x) for x in data["key_findings"]][:20]
+        if isinstance(data.get("recommended_action"), str) and data["recommended_action"] in fixed_actions:
+            verdict["recommended_action"] = data["recommended_action"]
+        if isinstance(data.get("detailed_reasoning"), str) and data["detailed_reasoning"].strip():
+            verdict["detailed_reasoning"] = data["detailed_reasoning"]
+        if isinstance(data.get("attack_surface_mapping"), dict):
+            verdict["attack_surface_mapping"] = data["attack_surface_mapping"]
+    return verdict
+
+
+async def call_mistral(scan_context):
+    if not MISTRAL_API_KEY:
+        return default_verdict()
+    prompt = (
+        "You are a security analyst. Return strict JSON only with keys: "
+        "threat_score, classification, confidence, summary, key_findings, recommended_action, detailed_reasoning, attack_surface_mapping. "
+        "classification must be one of clean,suspicious,malicious,phishing,malware_distribution,cryptojacking,data_harvesting. "
+        "recommended_action must be one of allow,monitor,manual_review,block,quarantine. "
+        "attack_surface_mapping must include entry_points,sensitive_routes,third_party_risk_nodes,notes. "
+        "Analyze this scan context: "
+        + json.dumps(scan_context, ensure_ascii=False)
+    )
+    payload = {
+        "model": "mistral-medium-latest",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 1200,
+        "top_p": 1,
+    }
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            resp = await client.post("https://api.mistral.ai/v1/chat/completions", json=payload, headers=headers)
+            body = resp.json()
+            content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+            parsed = extract_json_object(content)
+            return normalize_verdict(parsed)
+        except Exception:
+            return default_verdict()
+
+
+def build_redirect_chain(main_request):
+    chain = []
+    req = main_request
+    while req is not None:
+        chain.append(req.url)
+        req = req.redirected_from
+    return chain
+
+
+def set_network_hooks(page):
+    requests_log = []
+    responses_log = []
+
+    def on_request(req):
+        headers = req.headers if isinstance(req.headers, dict) else {}
+        requests_log.append(
+            {
+                "url": req.url,
+                "method": req.method,
+                "resource_type": req.resource_type,
+                "request_headers": headers,
+            }
+        )
+
+    def on_response(res):
+        req = res.request
+        responses_log.append(
+            {
+                "url": res.url,
+                "status": res.status,
+                "resource_type": req.resource_type,
+                "method": req.method,
+                "response_headers": dict(res.headers),
+            }
+        )
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+    return requests_log, responses_log
+
+
+INIT_SCRIPT = r"""
+(() => {
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+  window.__intelliscan_calls = [];
+  const nativeFetch = window.fetch;
+  window.fetch = function(...args) {
+    try {
+      window.__intelliscan_calls.push({ kind: 'fetch', url: String(args[0] || ''), ts: Date.now() });
+    } catch (e) {}
+    return nativeFetch.apply(this, args);
+  };
+  const nativeOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    try {
+      window.__intelliscan_calls.push({ kind: 'xhr', method: String(method || ''), url: String(url || ''), ts: Date.now() });
+    } catch (e) {}
+    return nativeOpen.call(this, method, url, ...rest);
+  };
+  const nativeEval = window.eval;
+  window.eval = function(code) {
+    try {
+      const c = String(code || '');
+      window.__intelliscan_calls.push({ kind: 'eval', snippet: c.slice(0, 240), ts: Date.now() });
+    } catch (e) {}
+    return nativeEval.call(this, code);
+  };
+})();
+"""
+
+
+def categorize_urls(base_url, network_responses, collected_urls, js_found):
+    base_host = urlparse(base_url).netloc
+    network_map = {}
+    for n in network_responses:
+        u = normalize_url(n.get("url", ""), base_url)
+        if not u:
+            continue
+        network_map[u] = {
+            "url": u,
+            "resource_type": n.get("resource_type", "unknown"),
+            "http_status": n.get("status", 0),
+        }
+
+    js_url_set = set(j.get("url", "") for j in js_found if j.get("url"))
+    html_attr_set = set(c.get("url", "") for c in collected_urls if c.get("url"))
+    network_set = set(network_map.keys())
+
+    crawled = []
+    for u, item in network_map.items():
+        crawled.append(
+            {
+                "url": u,
+                "resource_type": item["resource_type"],
+                "http_status": item["http_status"],
+                "also_discovered_in_javascript": u in js_url_set,
+            }
+        )
+
+    collected = []
+    for c in collected_urls:
+        u = c.get("url", "")
+        if not u:
+            continue
+        collected.append(
+            {
+                "url": u,
+                "discovery_method": c.get("discovery_method", "unknown"),
+                "raw_original_value": c.get("raw_original", ""),
+                "appeared_in_network_log": u in network_set,
+            }
+        )
+
+    hidden = []
+    for j in js_found:
+        u = j.get("url", "")
+        if not u:
+            continue
+        if u in html_attr_set:
+            continue
+        hidden.append(
+            {
+                "url": u,
+                "raw_original_value": j.get("raw_original", ""),
+                "confidence": j.get("confidence", "low"),
+                "called_during_session": u in network_set,
+            }
+        )
+
+    crawled = dedupe_dict_list(crawled, ["url", "resource_type", "http_status", "also_discovered_in_javascript"])
+    collected = dedupe_dict_list(collected, ["url", "discovery_method", "raw_original_value", "appeared_in_network_log"])
+    hidden = dedupe_dict_list(hidden, ["url", "raw_original_value", "confidence", "called_during_session"])
+
+    crawled_internal, crawled_third = domain_split(crawled, base_host)
+    collected_internal, collected_third = domain_split(collected, base_host)
+    hidden_internal, hidden_third = domain_split(hidden, base_host)
+
+    return {
+        "crawled_urls": crawled,
+        "collected_urls": collected,
+        "hidden_endpoints": hidden,
+        "internal_paths": {
+            "crawled": crawled_internal,
+            "collected": collected_internal,
+            "hidden": hidden_internal,
+        },
+        "third_party_domains": {
+            "crawled": crawled_third,
+            "collected": collected_third,
+            "hidden": hidden_third,
+        },
+    }
+
+
+def analyze_javascript(html_content, final_url, hooked_calls, network_responses):
+    soup = BeautifulSoup(html_content, "html.parser")
+    inline_scripts = []
+    external_scripts = []
+    all_script_text = []
+
+    for s in soup.find_all("script"):
+        src = (s.get("src") or "").strip()
+        if src:
+            norm = normalize_url(src, final_url)
+            if norm:
+                external_scripts.append({"url": norm, "raw_original": src})
+        text = s.string or s.get_text("\n", strip=False) or ""
+        if text.strip():
+            inline_scripts.append(text)
+            all_script_text.append(text)
+
+    joined_script_text = "\n".join(all_script_text)
+    obf_score, obf_markers = analyze_obfuscation(joined_script_text)
+    hidden_inputs = parse_hidden_inputs(soup)
+    suspicious_variables = parse_suspicious_variables(joined_script_text)
+    secrets = detect_secrets(joined_script_text)
+
+    js_found = []
+    for block in inline_scripts:
+        js_found.extend(extract_js_endpoints_from_text(block, final_url))
+
+    for call in hooked_calls:
+        raw = str(call.get("url", "")).strip()
+        absolute = normalize_url(raw, final_url)
+        if absolute:
+            js_found.append(
+                {
+                    "url": absolute,
+                    "raw_original": raw,
+                    "pattern": f"hooked_{call.get('kind', 'unknown')}",
+                    "confidence": "high",
+                }
+            )
+
+    network_set = set(normalize_url(n.get("url", ""), final_url) for n in network_responses)
+    js_found_clean = []
+    for j in js_found:
+        u = j.get("url", "")
+        if not u:
+            continue
+        x = dict(j)
+        x["called_during_session"] = u in network_set
+        js_found_clean.append(x)
+
+    js_found_clean = dedupe_dict_list(js_found_clean, ["url", "raw_original", "pattern", "confidence", "called_during_session"])
+    external_scripts = dedupe_dict_list(external_scripts, ["url", "raw_original"])
+
+    return {
+        "inline_script_count": len(inline_scripts),
+        "external_scripts": external_scripts,
+        "obfuscation_score": obf_score,
+        "obfuscation_markers": obf_markers,
+        "hidden_inputs": hidden_inputs,
+        "suspicious_variables": suspicious_variables,
+        "secrets": secrets,
+        "js_discovered_urls": js_found_clean,
+    }
+
+
+async def run_scan():
+    if not TARGET_URL or not SCAN_ID or not CALLBACK_URL:
+        raise RuntimeError("Missing required environment values TARGET_URL, SCAN_ID, or CALLBACK_URL")
+
+    identity = build_identity()
+    await post_progress(PROGRESS_STAGES[0])
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=identity["user_agent"],
+            viewport=identity["viewport"],
+            locale=identity["locale"],
+            timezone_id=identity["timezone_id"],
+            extra_http_headers=identity["headers"],
+        )
+        await context.add_init_script(INIT_SCRIPT)
+        await post_progress(PROGRESS_STAGES[1])
+
+        page = await context.new_page()
+        requests_log, responses_log = set_network_hooks(page)
+
+        try:
+            main_response = await page.goto(TARGET_URL, wait_until="networkidle", timeout=45000)
+        except Exception:
+            main_response = await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(3)
+        await post_progress(PROGRESS_STAGES[2])
+
+        screenshot_bytes = await page.screenshot(full_page=True)
+        screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        await post_progress(PROGRESS_STAGES[3])
+
+        html_content = await page.content()
+        final_url = page.url
+        page_title = await page.title()
+        cookies = await context.cookies()
+
+        hooked_calls = await page.evaluate("window.__intelliscan_calls || []")
+        js_analysis = analyze_javascript(html_content, final_url, hooked_calls, responses_log)
+        await post_progress(PROGRESS_STAGES[4])
+
+        soup = BeautifulSoup(html_content, "html.parser")
+        collected_urls = collect_attribute_urls(soup, final_url)
+        categorized = categorize_urls(final_url, responses_log, collected_urls, js_analysis["js_discovered_urls"])
+        await post_progress(PROGRESS_STAGES[5])
+
+        network_activity = dedupe_dict_list(
+            [
+                {
+                    "url": normalize_url(r.get("url", ""), final_url),
+                    "method": r.get("method", "GET"),
+                    "resource_type": r.get("resource_type", "unknown"),
+                    "request_headers": r.get("request_headers", {}),
+                    "status": next((x.get("status", 0) for x in responses_log if x.get("url") == r.get("url")), 0),
+                    "response_headers": next((x.get("response_headers", {}) for x in responses_log if x.get("url") == r.get("url")), {}),
+                }
+                for r in requests_log
+                if normalize_url(r.get("url", ""), final_url)
+            ],
+            ["url", "method", "resource_type", "status"],
+        )
+        await post_progress(PROGRESS_STAGES[6])
+
+        redirect_chain = []
+        if main_response is not None:
+            redirect_chain = build_redirect_chain(main_response.request)
+
+        scan_context = {
+            "target_url": TARGET_URL,
+            "final_url": final_url,
+            "page_title": page_title,
+            "redirect_chain": redirect_chain,
+            "counts": {
+                "network": len(network_activity),
+                "crawled": len(categorized["crawled_urls"]),
+                "collected": len(categorized["collected_urls"]),
+                "hidden": len(categorized["hidden_endpoints"]),
+                "hidden_inputs": len(js_analysis["hidden_inputs"]),
+                "suspicious_variables": len(js_analysis["suspicious_variables"]),
+                "secrets": len(js_analysis["secrets"]),
+            },
+            "javascript": {
+                "obfuscation_score": js_analysis["obfuscation_score"],
+                "obfuscation_markers": js_analysis["obfuscation_markers"],
+                "hidden_inputs": js_analysis["hidden_inputs"],
+                "suspicious_variables": js_analysis["suspicious_variables"],
+                "secrets": js_analysis["secrets"],
+            },
+            "url_intelligence": {
+                "crawled_urls": categorized["crawled_urls"][:120],
+                "collected_urls": categorized["collected_urls"][:120],
+                "hidden_endpoints": categorized["hidden_endpoints"][:120],
+                "internal_paths": categorized["internal_paths"],
+                "third_party_domains": categorized["third_party_domains"],
+            },
+        }
+
+        await post_progress(PROGRESS_STAGES[7])
+        verdict = await call_mistral(scan_context)
+        await post_progress(PROGRESS_STAGES[8])
+
+        result = {
+            "scan_id": SCAN_ID,
+            "target_url": TARGET_URL,
+            "final_url": final_url,
+            "redirect_chain": redirect_chain,
+            "page_title": page_title,
+            "cookies": [{"name": c.get("name", ""), "value": c.get("value", "")} for c in cookies],
+            "identity": identity,
+            "network_activity": network_activity,
+            "crawled_urls": categorized["crawled_urls"],
+            "collected_urls": categorized["collected_urls"],
+            "hidden_endpoints": categorized["hidden_endpoints"],
+            "internal_paths": categorized["internal_paths"],
+            "third_party_domains": categorized["third_party_domains"],
+            "js_analysis": {
+                "inline_script_count": js_analysis["inline_script_count"],
+                "external_scripts": js_analysis["external_scripts"],
+                "obfuscation_score": js_analysis["obfuscation_score"],
+                "obfuscation_markers": js_analysis["obfuscation_markers"],
+                "hidden_inputs": js_analysis["hidden_inputs"],
+                "suspicious_variables": js_analysis["suspicious_variables"],
+                "secrets": js_analysis["secrets"],
+                "js_discovered_urls": js_analysis["js_discovered_urls"],
+            },
+            "threat_score": verdict["threat_score"],
+            "classification": verdict["classification"],
+            "confidence": verdict["confidence"],
+            "summary": verdict["summary"],
+            "key_findings": verdict["key_findings"],
+            "recommended_action": verdict["recommended_action"],
+            "ai_reasoning": verdict["detailed_reasoning"],
+            "attack_surface_mapping": verdict["attack_surface_mapping"],
+            "screenshot_base64": screenshot_b64,
+        }
+
+        await browser.close()
+        return result
+
+
+async def post_result(payload):
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(CALLBACK_URL, json=payload)
+        response.raise_for_status()
+
+
+async def main():
+    try:
+        print("scanner:start", flush=True)
+        result = await run_scan()
+        await post_result(result)
+        await post_progress(PROGRESS_STAGES[9])
+        print("scanner:complete", flush=True)
+    except Exception as exc:
+        print(f"scanner:error:{exc}", flush=True)
+        error_payload = {"scan_id": SCAN_ID, "status": "failed", "error": str(exc)}
+        try:
+            await post_result(error_payload)
+        except Exception as post_exc:
+            print(f"scanner:callback_error:{post_exc}", flush=True)
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception:
+        sys.exit(1)
