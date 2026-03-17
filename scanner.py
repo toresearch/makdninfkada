@@ -5,7 +5,7 @@ import os
 import random
 import re
 import sys
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -328,6 +328,170 @@ def collect_attribute_urls(soup, base_url):
     return dedupe_dict_list(out, ["url", "discovery_method", "raw_original"])
 
 
+def parse_form_parameters(soup, page_url):
+    out = []
+    sensitive_words = {"token", "csrf", "secret", "auth", "key", "password", "session", "jwt", "otp"}
+    form_nodes = soup.find_all("form")
+    for form in form_nodes:
+        action = normalize_url((form.get("action") or "").strip(), page_url) or page_url
+        method = (form.get("method") or "GET").upper()
+        for node in form.find_all(["input", "textarea", "select"]):
+            name = (node.get("name") or "").strip()
+            if not name:
+                continue
+            value = (node.get("value") or "").strip()
+            field_type = (node.get("type") or node.name or "text").lower()
+            out.append(
+                {
+                    "name": name,
+                    "sample_value": value,
+                    "source": "form",
+                    "source_url": action,
+                    "http_method": method,
+                    "field_type": field_type,
+                    "sensitive_name": any(x in name.lower() for x in sensitive_words),
+                    "confidence": "high" if field_type == "hidden" else "medium",
+                }
+            )
+    return out
+
+
+def parse_url_parameters(url_value, source):
+    out = []
+    parsed = urlparse(url_value)
+    if not parsed.query:
+        return out
+    sensitive_words = {"token", "csrf", "secret", "auth", "key", "password", "session", "jwt", "otp"}
+    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if not name:
+            continue
+        out.append(
+            {
+                "name": name,
+                "sample_value": value,
+                "source": source,
+                "source_url": url_value,
+                "http_method": "GET",
+                "field_type": "query",
+                "sensitive_name": any(x in name.lower() for x in sensitive_words),
+                "confidence": "high",
+            }
+        )
+    return out
+
+
+def parse_js_parameters(script_text, source_url):
+    out = []
+    sensitive_words = {"token", "csrf", "secret", "auth", "key", "password", "session", "jwt", "otp"}
+    key_matches = set(re.findall(r"['\"]([a-zA-Z_][a-zA-Z0-9_\-]{1,40})['\"]\s*:", script_text))
+    url_param_matches = set(re.findall(r"(?:append|set|get|has)\s*\(\s*['\"]([a-zA-Z_][a-zA-Z0-9_\-]{1,40})['\"]", script_text))
+    all_names = key_matches.union(url_param_matches)
+    noisy = {"https", "http", "width", "height", "length", "status", "method", "headers", "body", "data", "url"}
+    for name in all_names:
+        lower = name.lower()
+        if lower in noisy:
+            continue
+        if len(lower) < 3:
+            continue
+        confidence = "high" if any(x in lower for x in sensitive_words) else "low"
+        out.append(
+            {
+                "name": name,
+                "sample_value": "",
+                "source": "javascript",
+                "source_url": source_url,
+                "http_method": "UNKNOWN",
+                "field_type": "js_key",
+                "sensitive_name": any(x in lower for x in sensitive_words),
+                "confidence": confidence,
+            }
+        )
+    return out
+
+
+def parse_body_parameters(post_data, source_url, method):
+    out = []
+    if not post_data:
+        return out
+    sensitive_words = {"token", "csrf", "secret", "auth", "key", "password", "session", "jwt", "otp"}
+    text = str(post_data).strip()
+    if not text:
+        return out
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                key_name = str(key).strip()
+                if not key_name:
+                    continue
+                out.append(
+                    {
+                        "name": key_name,
+                        "sample_value": str(value)[:180],
+                        "source": "network_body",
+                        "source_url": source_url,
+                        "http_method": method,
+                        "field_type": "json",
+                        "sensitive_name": any(x in key_name.lower() for x in sensitive_words),
+                        "confidence": "high",
+                    }
+                )
+        return out
+    except Exception:
+        pass
+
+    for key, value in parse_qsl(text, keep_blank_values=True):
+        if not key:
+            continue
+        out.append(
+            {
+                "name": key,
+                "sample_value": value,
+                "source": "network_body",
+                "source_url": source_url,
+                "http_method": method,
+                "field_type": "form_encoded",
+                "sensitive_name": any(x in key.lower() for x in sensitive_words),
+                "confidence": "high",
+            }
+        )
+    return out
+
+
+def build_hidden_parameters(final_url, all_collected_urls, all_requests_log, all_form_params, all_script_text):
+    items = []
+    items.extend(all_form_params)
+
+    for c in all_collected_urls:
+        u = c.get("url", "")
+        if u:
+            items.extend(parse_url_parameters(u, "collected_url"))
+
+    for r in all_requests_log:
+        req_url = normalize_url(r.get("url", ""), final_url)
+        method = str(r.get("method", "GET") or "GET").upper()
+        if req_url:
+            items.extend(parse_url_parameters(req_url, "network_url"))
+        items.extend(parse_body_parameters(r.get("post_data", ""), req_url or final_url, method))
+
+    items.extend(parse_js_parameters(all_script_text, final_url))
+
+    out = []
+    seen = set()
+    for i in items:
+        name = (i.get("name") or "").strip()
+        if not name:
+            continue
+        key = (name.lower(), i.get("source", ""), i.get("source_url", ""), i.get("field_type", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(i)
+
+    out.sort(key=lambda x: (0 if x.get("sensitive_name") else 1, x.get("name", "").lower()))
+    return out
+
+
 def log_stage(stage):
     print(f"progress:{stage}", flush=True)
 
@@ -353,6 +517,7 @@ def set_network_hooks(page):
                 "method": req.method,
                 "resource_type": req.resource_type,
                 "request_headers": headers,
+                "post_data": req.post_data or "",
             }
         )
 
@@ -371,6 +536,85 @@ def set_network_hooks(page):
     page.on("request", on_request)
     page.on("response", on_response)
     return requests_log, responses_log
+
+
+async def crawl_internal_pages(context, seed_urls, base_host, max_pages=4):
+    queue = []
+    seen = set()
+    for u in seed_urls:
+        parsed = urlparse(u)
+        if not parsed.netloc or parsed.netloc != base_host:
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        queue.append(u)
+
+    visited = []
+    all_requests = []
+    all_responses = []
+    all_collected = []
+    all_js_found = []
+    all_form_params = []
+    all_script_text = []
+
+    while queue and len(visited) < max_pages:
+        url = queue.pop(0)
+        page = await context.new_page()
+        req_log, res_log = set_network_hooks(page)
+        title = ""
+        status = 0
+        try:
+            try:
+                response = await page.goto(url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1.2)
+            title = await page.title()
+            status = response.status if response else 0
+            html_content = await page.content()
+            final_url = page.url
+            hooked_calls = await page.evaluate("window.__intelliscan_calls || []")
+            js_analysis = analyze_javascript(html_content, final_url, hooked_calls, res_log)
+            soup = BeautifulSoup(html_content, "html.parser")
+            collected_urls = collect_attribute_urls(soup, final_url)
+            form_params = parse_form_parameters(soup, final_url)
+            script_text = "\n".join(s.string or s.get_text("\n", strip=False) or "" for s in soup.find_all("script"))
+
+            all_requests.extend(req_log)
+            all_responses.extend(res_log)
+            all_collected.extend(collected_urls)
+            all_js_found.extend(js_analysis["js_discovered_urls"])
+            all_form_params.extend(form_params)
+            all_script_text.append(script_text)
+
+            for node in soup.find_all("a"):
+                href = normalize_url((node.get("href") or "").strip(), final_url)
+                if not href:
+                    continue
+                p = urlparse(href)
+                if p.netloc != base_host:
+                    continue
+                if href in seen:
+                    continue
+                seen.add(href)
+                if len(queue) + len(visited) < max_pages * 3:
+                    queue.append(href)
+        except Exception:
+            pass
+        finally:
+            visited.append({"url": url, "title": title, "status": status})
+            await page.close()
+
+    return {
+        "visited_pages": visited,
+        "requests_log": all_requests,
+        "responses_log": all_responses,
+        "collected_urls": all_collected,
+        "js_discovered_urls": all_js_found,
+        "form_parameters": all_form_params,
+        "script_text": "\n".join(all_script_text),
+    }
 
 
 INIT_SCRIPT = r"""
@@ -590,6 +834,7 @@ async def run_scan():
         final_url = page.url
         page_title = await page.title()
         cookies = await context.cookies()
+        base_host = urlparse(final_url).netloc
 
         hooked_calls = await page.evaluate("window.__intelliscan_calls || []")
         js_analysis = analyze_javascript(html_content, final_url, hooked_calls, responses_log)
@@ -597,7 +842,24 @@ async def run_scan():
 
         soup = BeautifulSoup(html_content, "html.parser")
         collected_urls = collect_attribute_urls(soup, final_url)
-        categorized = categorize_urls(final_url, responses_log, collected_urls, js_analysis["js_discovered_urls"])
+        initial_form_parameters = parse_form_parameters(soup, final_url)
+
+        internal_seed_links = [
+            x.get("url", "")
+            for x in collected_urls
+            if x.get("discovery_method") == "a.href" and urlparse(x.get("url", "")).netloc == base_host
+        ]
+        crawl_data = await crawl_internal_pages(context, internal_seed_links, base_host, max_pages=5)
+
+        merged_requests_log = requests_log + crawl_data["requests_log"]
+        merged_responses_log = responses_log + crawl_data["responses_log"]
+        merged_collected_urls = dedupe_dict_list(collected_urls + crawl_data["collected_urls"], ["url", "discovery_method", "raw_original"])
+        merged_js_urls = dedupe_dict_list(js_analysis["js_discovered_urls"] + crawl_data["js_discovered_urls"], ["url", "raw_original", "pattern", "confidence", "called_during_session"])
+        merged_form_parameters = dedupe_dict_list(initial_form_parameters + crawl_data["form_parameters"], ["name", "source", "source_url", "field_type", "http_method"])
+        merged_script_text = "\n".join([s.string or s.get_text("\n", strip=False) or "" for s in soup.find_all("script")]) + "\n" + crawl_data["script_text"]
+
+        categorized = categorize_urls(final_url, merged_responses_log, merged_collected_urls, merged_js_urls)
+        hidden_parameters = build_hidden_parameters(final_url, merged_collected_urls, merged_requests_log, merged_form_parameters, merged_script_text)
         log_stage(PROGRESS_STAGES[5])
 
         network_activity = dedupe_dict_list(
@@ -607,10 +869,10 @@ async def run_scan():
                     "method": r.get("method", "GET"),
                     "resource_type": r.get("resource_type", "unknown"),
                     "request_headers": r.get("request_headers", {}),
-                    "status": next((x.get("status", 0) for x in responses_log if x.get("url") == r.get("url")), 0),
-                    "response_headers": next((x.get("response_headers", {}) for x in responses_log if x.get("url") == r.get("url")), {}),
+                    "status": next((x.get("status", 0) for x in merged_responses_log if x.get("url") == r.get("url")), 0),
+                    "response_headers": next((x.get("response_headers", {}) for x in merged_responses_log if x.get("url") == r.get("url")), {}),
                 }
-                for r in requests_log
+                for r in merged_requests_log
                 if normalize_url(r.get("url", ""), final_url)
             ],
             ["url", "method", "resource_type", "status"],
@@ -630,9 +892,14 @@ async def run_scan():
             "cookies": [{"name": c.get("name", ""), "value": c.get("value", "")} for c in cookies],
             "identity": identity,
             "network_activity": network_activity,
+            "crawl_summary": {
+                "visited_pages": crawl_data["visited_pages"],
+                "visited_count": len(crawl_data["visited_pages"]),
+            },
             "crawled_urls": categorized["crawled_urls"],
             "collected_urls": categorized["collected_urls"],
             "hidden_endpoints": categorized["hidden_endpoints"],
+            "hidden_parameters": hidden_parameters,
             "internal_paths": categorized["internal_paths"],
             "third_party_domains": categorized["third_party_domains"],
             "js_analysis": {
